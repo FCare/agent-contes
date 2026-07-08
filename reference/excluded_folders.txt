@@ -1,0 +1,17 @@
+# Dossiers de premier niveau (sous CONTES_ROOT) à exclure du catalogue de
+# contes car ce sont des albums de musique instrumentale sans narration.
+# Un nom par ligne, correspondance exacte avec le nom du dossier.
+# Liste candidate à valider avec François avant le premier scan — voir le
+# plan pour les cas ambigus (Valérie Lemercier/Tugan Sokhiev, Le_BGG,
+# Coccinelle_sur_mon_violoncelle ne sont volontairement PAS inclus ici).
+Nina Simone
+Musiques_Diverses
+Jazz_a_la_recre
+Amazing Keystone Big Band
+Laclede Quartet
+Misja Fitzgerald Michel
+Doudou Swing
+Youssou N'Dour
+Steve Waring
+Slavadore Jazze
+Walt Disney Records

@@ -1,0 +1,84 @@
+import argparse
+import asyncio
+import logging
+import sys
+
+import db
+from . import classify as classify_stage
+from . import duration as duration_stage
+from . import embed as embed_stage
+from . import enrich_web as enrich_web_stage
+from . import identify_speakers as identify_speakers_stage
+from . import scan as scan_stage
+from . import split_stories as split_stories_stage
+from . import summarize as summarize_stage
+from . import transcribe as transcribe_stage
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+STAGES = ["scan", "duration", "transcribe", "split_stories", "identify_speakers", "summarize", "embed"]
+# Ni l'une ni l'autre ne font partie de "all" : backfill_* sont des migrations
+# ponctuelles pour les histoires déjà 'ready' avant l'ajout d'une fonctionnalité ;
+# enrich_web sollicite un service externe (recherche web) et doit rester un choix
+# explicite, pas un effet de bord automatique de chaque histoire nouvellement traitée.
+# classify_* : à lancer dans l'ordre traits -> themes -> consolidate_themes -> assign_themes
+# (consolidate_themes doit être relancé après tout ajout d'histoires pour que les
+# classes reflètent le catalogue à jour, donc reste un choix explicite).
+EXTRA_STAGES = [
+    "backfill_keywords", "backfill_fts", "enrich_web",
+    "classify_traits", "propose_themes", "consolidate_themes", "assign_themes",
+]
+
+
+async def run(stage: str, only_new: bool, story_id: int | None, limit: int | None) -> None:
+    await db.init_db()
+    if stage in ("scan", "all"):
+        await scan_stage.scan(only_new=only_new)
+    if stage in ("duration", "all"):
+        await duration_stage.compute_durations()
+    if stage in ("transcribe", "all"):
+        await transcribe_stage.transcribe_pending(story_id=story_id)
+    if stage in ("split_stories", "all"):
+        await split_stories_stage.split_pending(story_id=story_id)
+    if stage in ("identify_speakers", "all"):
+        await identify_speakers_stage.identify_speakers_pending(story_id=story_id)
+    if stage in ("summarize", "all"):
+        await summarize_stage.summarize_pending(story_id=story_id)
+    if stage in ("embed", "all"):
+        await embed_stage.embed_pending(story_id=story_id)
+    if stage == "backfill_keywords":
+        await summarize_stage.backfill_keywords(story_id=story_id)
+    if stage == "backfill_fts":
+        await summarize_stage.backfill_fts(story_id=story_id)
+    if stage == "enrich_web":
+        await enrich_web_stage.enrich_pending(story_id=story_id, limit=limit)
+    if stage == "classify_traits":
+        await classify_stage.classify_traits_pending(story_id=story_id, limit=limit)
+    if stage == "propose_themes":
+        await classify_stage.propose_raw_themes_pending(story_id=story_id, limit=limit)
+    if stage == "consolidate_themes":
+        await classify_stage.consolidate_theme_classes()
+    if stage == "assign_themes":
+        await classify_stage.assign_theme_classes_pending(story_id=story_id, limit=limit)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Pipeline de référencement des contes")
+    parser.add_argument("--stage", choices=[*STAGES, *EXTRA_STAGES, "all"], default="all")
+    parser.add_argument("--only-new", action="store_true",
+                         help="Ignore les histoires déjà présentes en base lors du scan")
+    parser.add_argument("--story-id", type=int, default=None,
+                         help="Limiter transcribe/identify_speakers/summarize/embed/enrich_web/classify_* à une seule histoire")
+    parser.add_argument("--limit", type=int, default=None,
+                         help="Limiter enrich_web/classify_traits/propose_themes/assign_themes à N histoires (traitement par lots)")
+    args = parser.parse_args()
+    asyncio.run(run(args.stage, args.only_new, args.story_id, args.limit))
+
+
+if __name__ == "__main__":
+    main()

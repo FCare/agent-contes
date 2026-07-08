@@ -1,0 +1,34 @@
+networks:
+  ansible:
+    external: true
+
+services:
+  contes-agent:
+    build: .
+    container_name: contes-agent
+    env_file: .env
+    ports:
+      - "8090:8000"
+    networks:
+      - ansible
+    volumes:
+      - /mnt/mnemonic/francois/Contes:/contes:ro
+      - contes-data:/data
+      - hf-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  contes-data:
+  hf-cache:
