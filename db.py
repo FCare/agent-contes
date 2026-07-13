@@ -223,6 +223,21 @@ async def init_db() -> None:
     logger.info("DB initialisée")
 
 
+async def find_story_id_by_title(title_query: str) -> int | None:
+    """Résout un titre approximatif vers un story_id réel — filet de sécurité pour le cas
+    où l'appelant (LLM) devine un story_id en texte libre au lieu d'appeler search_contes
+    d'abord (observé en pratique : 'story_id': 'le petit prince')."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT id FROM stories WHERE title LIKE ? AND status = 'ready' "
+            "ORDER BY LENGTH(title) LIMIT 1",
+            (f"%{title_query}%",),
+        ) as cur:
+            row = await cur.fetchone()
+    return row["id"] if row else None
+
+
 async def get_story(story_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row

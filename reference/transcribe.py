@@ -24,14 +24,55 @@ _align_metadata = None
 _diarize_pipeline = None
 
 
+def _reset_models_to_cpu():
+    """Abandonne les modèles déjà chargés en VRAM et force CPU/int8 pour tous les
+    chargements suivants. Un modèle déjà chargé sur cuda ne peut pas être basculé
+    simplement en changeant WHISPER_DEVICE — il faut le recharger."""
+    global _asr_model, _align_model, _align_metadata, _diarize_pipeline
+    global WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
+    _asr_model = None
+    _align_model = None
+    _align_metadata = None
+    _diarize_pipeline = None
+    WHISPER_DEVICE = "cpu"
+    WHISPER_COMPUTE_TYPE = "int8"
+    import torch
+    torch.cuda.empty_cache()
+
+
+def _load_with_cuda_fallback(load_fn, label: str):
+    """Tente le chargement sur WHISPER_DEVICE (cuda par défaut) ; si la VRAM est
+    insuffisante, bascule sur CPU pour ce modèle et pour tous les chargements suivants de
+    cette exécution. Les services persistants du serveur (vLLM, moshi-server) gardent leur
+    VRAM allouée en permanence — contrairement à une contention ponctuelle, attendre ou
+    réessayer plus tard ne change rien, donc sans ce repli la synchronisation nocturne du
+    catalogue échouait systématiquement dès qu'un autre service GPU tournait, ce qui est le
+    cas en continu sur cette machine. int8_float16 n'étant pas supporté sur CPU, on bascule
+    aussi WHISPER_COMPUTE_TYPE sur 'int8' dans ce cas."""
+    global WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
+    try:
+        return load_fn(WHISPER_DEVICE, WHISPER_COMPUTE_TYPE)
+    except RuntimeError as e:
+        if "out of memory" not in str(e).lower() or WHISPER_DEVICE == "cpu":
+            raise
+        logger.warning(f"{label}: VRAM insuffisante sur {WHISPER_DEVICE}, repli sur CPU pour cette exécution: {e}")
+        WHISPER_DEVICE = "cpu"
+        WHISPER_COMPUTE_TYPE = "int8"
+        import torch
+        torch.cuda.empty_cache()
+        return load_fn(WHISPER_DEVICE, WHISPER_COMPUTE_TYPE)
+
+
 def _get_asr_model():
     global _asr_model
     if _asr_model is None:
         import whisperx
-        logger.info(f"Chargement whisper {WHISPER_MODEL} ({WHISPER_COMPUTE_TYPE}) sur {WHISPER_DEVICE}")
-        _asr_model = whisperx.load_model(
-            WHISPER_MODEL, WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE, language="fr",
-        )
+
+        def _load(device, compute_type):
+            logger.info(f"Chargement whisper {WHISPER_MODEL} ({compute_type}) sur {device}")
+            return whisperx.load_model(WHISPER_MODEL, device, compute_type=compute_type, language="fr")
+
+        _asr_model = _load_with_cuda_fallback(_load, "whisper ASR")
     return _asr_model
 
 
@@ -39,10 +80,12 @@ def _get_align_model():
     global _align_model, _align_metadata
     if _align_model is None:
         import whisperx
-        logger.info("Chargement du modèle d'alignement fr")
-        _align_model, _align_metadata = whisperx.load_align_model(
-            language_code="fr", device=WHISPER_DEVICE
-        )
+
+        def _load(device, _compute_type):
+            logger.info("Chargement du modèle d'alignement fr")
+            return whisperx.load_align_model(language_code="fr", device=device)
+
+        _align_model, _align_metadata = _load_with_cuda_fallback(_load, "modèle d'alignement")
     return _align_model, _align_metadata
 
 
@@ -50,10 +93,12 @@ def _get_diarize_pipeline():
     global _diarize_pipeline
     if _diarize_pipeline is None:
         import whisperx.diarize
-        logger.info(f"Chargement du pipeline de diarization pyannote ({DIARIZATION_MODEL})")
-        _diarize_pipeline = whisperx.diarize.DiarizationPipeline(
-            model_name=DIARIZATION_MODEL, token=HF_TOKEN, device=WHISPER_DEVICE
-        )
+
+        def _load(device, _compute_type):
+            logger.info(f"Chargement du pipeline de diarization pyannote ({DIARIZATION_MODEL})")
+            return whisperx.diarize.DiarizationPipeline(model_name=DIARIZATION_MODEL, token=HF_TOKEN, device=device)
+
+        _diarize_pipeline = _load_with_cuda_fallback(_load, "diarization")
     return _diarize_pipeline
 
 
@@ -104,6 +149,23 @@ async def transcribe_pending(story_id: int | None = None) -> dict:
             abs_path = CONTES_ROOT / row["file_path"]
             try:
                 segments = _transcribe_track(abs_path)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and WHISPER_DEVICE != "cpu":
+                    # L'OOM peut survenir pendant l'inférence elle-même (transcribe/align/
+                    # diarize), pas seulement au chargement — un modèle déjà en VRAM ne
+                    # bascule pas tout seul, il faut l'abandonner et le recharger sur CPU.
+                    logger.warning(f"transcribe: VRAM insuffisante sur {abs_path}, repli sur CPU pour le reste de cette exécution: {e}")
+                    _reset_models_to_cpu()
+                    try:
+                        segments = _transcribe_track(abs_path)
+                    except Exception as e2:
+                        logger.error(f"transcribe: échec {abs_path} même après repli CPU: {e2}")
+                        n_errors += 1
+                        continue
+                else:
+                    logger.error(f"transcribe: échec {abs_path}: {e}")
+                    n_errors += 1
+                    continue
             except Exception as e:
                 logger.error(f"transcribe: échec {abs_path}: {e}")
                 n_errors += 1

@@ -2,7 +2,9 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -13,6 +15,8 @@ import contes_tools
 import db
 import playlist
 from reference import classify
+from reference import pipeline as pipeline_stage
+from reference import scan as scan_stage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,8 +34,38 @@ CONTES_ROOT = Path(os.environ.get("CONTES_ROOT", "/contes"))
 
 AGENT_NAME = "contes"
 _subscribed_sessions: set[str] = set()
+DAILY_ORPHAN_CHECK_HOUR = int(os.environ.get("DAILY_ORPHAN_CHECK_HOUR", "4"))  # heure locale Europe/Paris
 
 app = FastAPI(title="contes-agent")
+
+
+async def _daily_catalog_sync_loop() -> None:
+    """Chaque jour vers DAILY_ORPHAN_CHECK_HOUR (heure de Paris), synchronise le catalogue
+    avec le disque dans les deux sens :
+    - nouveaux contes : pipeline complet (scan, durée, transcription, découpage,
+      identification des locuteurs, résumé, embeddings) sur tout ce qui n'a pas encore
+      été traité — only_new=True pour ne pas retraiter ce qui l'est déjà ;
+    - contes supprimés : marqués 'missing' (voir reference.scan.mark_missing), pour
+      qu'ils disparaissent des recherches sans perdre leurs données si le disque
+      réapparaît (ex: point de montage temporairement indisponible)."""
+    tz = ZoneInfo("Europe/Paris")
+    while True:
+        now = datetime.now(tz)
+        next_run = now.replace(hour=DAILY_ORPHAN_CHECK_HOUR, minute=0, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        await asyncio.sleep((next_run - now).total_seconds())
+        logger.info("Synchronisation quotidienne du catalogue de contes...")
+        try:
+            await pipeline_stage.run(stage="all", only_new=True, story_id=None, limit=None)
+            logger.info("Traitement des nouveaux contes terminé")
+        except Exception as e:
+            logger.error(f"Traitement des nouveaux contes échoué: {e}")
+        try:
+            result = await scan_stage.mark_missing()
+            logger.info(f"Vérification orphelins terminée: {result}")
+        except Exception as e:
+            logger.error(f"Vérification orphelins échouée: {e}")
 
 
 @app.get("/health")
@@ -133,6 +167,12 @@ _REQUEST_DESCRIPTION = (
 )
 
 _RESULT_DESCRIPTION = (
+    "IMPORTANT pour la réponse orale, quel que soit le type de requête : quand tu "
+    "présentes une histoire trouvée, cite TOUJOURS son titre exact tel qu'il apparaît "
+    "dans 'title' — ne le remplace jamais par une paraphrase du contenu ou du résumé "
+    "('une histoire avec un géant et une enfant' au lieu de 'Le BGG'). Le titre vient "
+    "TOUJOURS en premier ; tu peux ajouter une courte accroche après, mais jamais à sa "
+    "place. "
     "Résultat de la requête contes. search_contes → deux champs : 'stories' (histoires "
     "candidates) et 'moments' (passages précis, dans l'histoire ou dans tout le "
     "catalogue), triés par pertinence décroissante — regarder les DEUX, la réponse à "
@@ -246,6 +286,7 @@ async def on_user_connected(topic: str, payload) -> None:
 
 async def main() -> None:
     await db.init_db()
+    asyncio.create_task(_daily_catalog_sync_loop())
 
     nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
     nexus.subscribe("common/user_connected", on_user_connected)

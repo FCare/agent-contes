@@ -163,3 +163,54 @@ async def scan(only_new: bool = False) -> dict:
               "excluded": n_excluded, "tracks": n_tracks}
     logger.info(f"scan: {result}")
     return result
+
+
+async def mark_missing() -> dict:
+    """Marque comme 'missing' les histoires dont le dossier a disparu de CONTES_ROOT
+    depuis le dernier scan, sans rien supprimer (transcription, résumé, bookmarks) — au
+    cas où la disparition est temporaire (ex: point de montage réseau indisponible).
+    Toutes les requêtes de recherche/catalogue filtrent déjà sur status = 'ready'
+    (search_stories_fts, count_ready_stories, sample_stories...), donc marquer 'missing'
+    suffit à faire disparaître l'histoire des résultats sans toucher à ces requêtes.
+    Si le dossier réapparaît, le statut est restauré à 'ready' — pas besoin de relancer
+    tout le pipeline de traitement (transcription, résumé...) pour un simple aller-retour
+    du disque."""
+    stories_on_disk = {
+        s["folder_path"] for s in _group_stories(_find_story_folders(CONTES_ROOT))
+    }
+    now = datetime.now(timezone.utc).isoformat()
+    n_missing = n_restored = 0
+
+    async with aiosqlite.connect(db.DB_PATH) as conn:
+        async with conn.execute(
+            "SELECT id, folder_path, status FROM stories WHERE status != 'excluded'"
+        ) as cur:
+            rows = await cur.fetchall()
+
+        for story_id, folder_path, status in rows:
+            # split_stories.py suffixe folder_path avec "#N" quand plusieurs histoires
+            # proviennent du même dossier physique (f"{folder_path}#{i}") — le dossier
+            # réel sur disque est celui SANS ce suffixe, sinon toute histoire issue d'un
+            # split est comparée à un chemin qui n'existera jamais tel quel et se
+            # retrouve marquée manquante à tort (vu en pratique : 249 faux positifs).
+            real_folder_path = re.sub(r"#\d+$", "", folder_path)
+            on_disk = real_folder_path in stories_on_disk
+            if not on_disk and status != "missing":
+                await conn.execute(
+                    "UPDATE stories SET status = 'missing', updated_at = ? WHERE id = ?",
+                    (now, story_id),
+                )
+                n_missing += 1
+                logger.info(f"mark_missing: histoire {story_id} ({folder_path}) introuvable sur disque, marquée 'missing'")
+            elif on_disk and status == "missing":
+                await conn.execute(
+                    "UPDATE stories SET status = 'ready', updated_at = ? WHERE id = ?",
+                    (now, story_id),
+                )
+                n_restored += 1
+                logger.info(f"mark_missing: histoire {story_id} ({folder_path}) réapparue sur disque, statut restauré à 'ready'")
+        await conn.commit()
+
+    result = {"missing": n_missing, "restored": n_restored}
+    logger.info(f"mark_missing: {result}")
+    return result

@@ -261,12 +261,31 @@ async def list_themes(args: dict) -> dict:
     return {"themes": [{"label": c["label"], "description": c["description"]} for c in classes]}
 
 
+async def _resolve_story_id(args: dict) -> tuple[int | None, dict | None]:
+    """Renvoie (story_id, None) si résolu, sinon (None, {"error": ...}). Accepte un
+    entier direct, ou une chaîne de titre approximative — garde-fou pour le cas où
+    l'appelant devine un titre à la place d'un vrai story_id plutôt que d'appeler
+    search_contes d'abord (observé en pratique : 'story_id': 'le petit prince')."""
+    story_id = args.get("story_id")
+    if story_id is None:
+        return None, {"error": "story_id requis"}
+    if isinstance(story_id, int):
+        return story_id, None
+    resolved = await db.find_story_id_by_title(str(story_id))
+    if resolved is not None:
+        return resolved, None
+    return None, {"error": "histoire introuvable"}
+
+
 async def story_details(args: dict) -> dict:
-    story = await db.get_story(args["story_id"])
+    story_id, error = await _resolve_story_id(args)
+    if error:
+        return error
+    story = await db.get_story(story_id)
     if not story:
         return {"error": "histoire introuvable"}
-    periods = await db.get_periods_for_story(args["story_id"])
-    bookmark = await db.get_bookmark(args["story_id"])
+    periods = await db.get_periods_for_story(story_id)
+    bookmark = await db.get_bookmark(story_id)
     return {
         "story_id": story["id"],
         "title": story["title"],
@@ -283,7 +302,9 @@ async def story_details(args: dict) -> dict:
 
 
 async def get_playlist(args: dict) -> dict:
-    story_id = args["story_id"]
+    story_id, error = await _resolve_story_id(args)
+    if error:
+        return error
     story = await db.get_story(story_id)
     if not story:
         return {"error": "histoire introuvable"}
@@ -320,7 +341,13 @@ async def get_playlist(args: dict) -> dict:
 
 
 async def save_bookmark(args: dict) -> dict:
-    await db.save_bookmark(args["story_id"], args["position_seconds"])
+    position_seconds = args.get("position_seconds")
+    if position_seconds is None:
+        return {"error": "position_seconds requis"}
+    story_id, error = await _resolve_story_id(args)
+    if error:
+        return error
+    await db.save_bookmark(story_id, position_seconds)
     return {"ok": True}
 
 
@@ -363,6 +390,17 @@ def _coerce_numeric_args(args: dict) -> dict:
 
 
 async def dispatch(req_type: str, args: dict) -> dict:
+    # Le champ 'type' est censé être obligatoire, mais le LLM appelant l'omet souvent
+    # malgré la consigne explicite (constaté en pratique sur environ un quart des
+    # appels) — plutôt que de renvoyer une erreur qui pousse le modèle à parfois
+    # halluciner une réponse plausible, on déduit un type par défaut raisonnable à
+    # partir de ce qui EST fourni : une vraie recherche si 'query' est présent, sinon
+    # un simple parcours du catalogue (list_stories n'a aucun champ obligatoire, donc
+    # ne peut jamais échouer de la même façon).
+    if not req_type:
+        req_type = "search_contes" if (args.get("query") or "").strip() else "list_stories"
+        logger.warning(f"contes_tools: 'type' manquant, déduit à {req_type!r} depuis les autres paramètres: {args}")
+
     handler = _HANDLERS.get(req_type)
     if not handler:
         return {"error": f"type inconnu: {req_type}. Disponibles: {', '.join(_HANDLERS)}"}
