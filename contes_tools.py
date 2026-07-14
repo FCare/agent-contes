@@ -135,12 +135,17 @@ async def _search_stories(query: str, top_k: int, min_minutes, max_minutes) -> l
     results = sorted(by_story.values(), key=lambda r: r["score"], reverse=True)[:top_k]
 
     # Enrichissement groupé plutôt que par source : la voie sémantique (Chroma) ne porte
-    # pas narrator dans ses métadonnées (figées au moment de l'embedding, avant l'ajout de
-    # ce champ) — un seul lookup ici couvre les 4 voies (auteur, sémantique, lexical,
-    # thème) sans avoir à modifier chacune de leurs requêtes SQL.
-    narrators = await db.get_narrators([r["story_id"] for r in results])
+    # pas narrator/literary_author dans ses métadonnées (figées au moment de l'embedding,
+    # avant l'ajout de ces champs) — un seul lookup ici couvre les 4 voies (auteur,
+    # sémantique, lexical, thème) sans avoir à modifier chacune de leurs requêtes SQL.
+    # "author" (brut, ambigu) ne sort jamais tel quel : replié dans literary_author
+    # seulement si l'enrichissement web n'a rien trouvé, jamais dans narrator.
+    info = await db.get_narrator_info([r["story_id"] for r in results])
     for r in results:
-        r["narrator"] = narrators.get(r["story_id"]) or r["author"]
+        entry = info.get(r["story_id"], {})
+        author = r.pop("author")
+        r["narrator"] = entry.get("narrator")
+        r["literary_author"] = entry.get("literary_author") or author
 
     return results
 
@@ -244,7 +249,7 @@ async def list_stories(args: dict) -> dict:
     stories = await db.sample_stories(limit=limit, offset=offset,
                                        min_duration_seconds=min_seconds, max_duration_seconds=max_seconds,
                                        age_range=age_range, mood=mood)
-    narrators = await db.get_narrators([s["id"] for s in stories])
+    info = await db.get_narrator_info([s["id"] for s in stories])
     actual_range_end = range_start + len(stories) - 1 if stories else range_start
     return {
         "total_stories": total,
@@ -255,8 +260,8 @@ async def list_stories(args: dict) -> dict:
             {
                 "story_id": s["id"],
                 "title": s["title"],
-                "author": s["author"],
-                "narrator": narrators.get(s["id"]) or s["author"],
+                "narrator": info.get(s["id"], {}).get("narrator"),
+                "literary_author": info.get(s["id"], {}).get("literary_author") or s["author"],
                 "duration_seconds": s["total_duration_seconds"],
             }
             for s in stories
@@ -300,8 +305,12 @@ async def story_details(args: dict) -> dict:
     return {
         "story_id": story["id"],
         "title": story["title"],
-        "author": story["author"],
-        "narrator": story["narrator"] or story["author"],
+        # narrator = qui LIT l'histoire à voix haute (null si pas identifié, ne pas
+        # deviner). literary_author = qui l'a ÉCRITE ; repli sur le champ brut du
+        # catalogue (stories.author) seulement si l'enrichissement web n'a rien trouvé —
+        # jamais réutilisé comme repli pour narrator (l'un ne prouve pas l'autre).
+        "narrator": story["narrator"] or None,
+        "literary_author": story["literary_author"] or story["author"],
         "long_summary": story["long_summary"],
         "total_duration_seconds": story["total_duration_seconds"],
         "periods": [

@@ -308,23 +308,30 @@ async def get_story(story_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-async def get_narrators(story_ids: list[int]) -> dict[int, str]:
-    """Lookup groupé de stories.narrator (nom confirmé/corrigé, voir init_db) — utilisé
-    par contes_tools pour enrichir a posteriori des résultats venus de sources qui ne
-    portent pas ce champ (Chroma notamment, dont les métadonnées sont figées au moment de
-    l'embedding et n'ont jamais narrator). Ne renvoie que les histoires où narrator est
-    effectivement renseigné : à l'appelant de retomber sur stories.author sinon."""
+async def get_narrator_info(story_ids: list[int]) -> dict[int, dict]:
+    """Lookup groupé de stories.narrator (qui LIT l'histoire, confirmé/corrigé par
+    narrator_identity.py) et stories.literary_author (qui a ÉCRIT l'histoire à l'origine,
+    enrichi via recherche web — voir enrich_web.py) — utilisé par contes_tools pour
+    enrichir a posteriori des résultats venus de sources qui ne portent pas ces champs
+    (Chroma notamment, dont les métadonnées sont figées au moment de l'embedding).
+    stories.author, lui, reste délibérément absent d'ici : c'est la valeur brute tirée du
+    nom de dossier, qui désigne tantôt le narrateur, tantôt un label de collection, tantôt
+    (cas piégeux observé en pratique) le nom de l'auteur littéraire glissé dans le dossier
+    — jamais fiable comme repli automatique pour narrator ni pour literary_author, sous
+    peine de faire dire à un narrateur qu'il a ÉCRIT l'histoire ou l'inverse."""
     if not story_ids:
         return {}
     async with aiosqlite.connect(DB_PATH) as conn:
         placeholders = ",".join("?" * len(story_ids))
         async with conn.execute(
-            f"SELECT id, narrator FROM stories WHERE id IN ({placeholders}) "
-            f"AND narrator IS NOT NULL AND narrator != ''",
+            f"SELECT id, narrator, literary_author FROM stories WHERE id IN ({placeholders})",
             story_ids,
         ) as cur:
             rows = await cur.fetchall()
-    return {r[0]: r[1] for r in rows}
+    return {
+        r[0]: {"narrator": r[1] or None, "literary_author": r[2] or None}
+        for r in rows
+    }
 
 
 async def get_tracks_for_story(story_id: int) -> list[dict]:
