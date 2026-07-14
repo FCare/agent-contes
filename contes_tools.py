@@ -132,8 +132,17 @@ async def _search_stories(query: str, top_k: int, min_minutes, max_minutes) -> l
                 "match_type": "theme",
             }
 
-    results = sorted(by_story.values(), key=lambda r: r["score"], reverse=True)
-    return results[:top_k]
+    results = sorted(by_story.values(), key=lambda r: r["score"], reverse=True)[:top_k]
+
+    # Enrichissement groupé plutôt que par source : la voie sémantique (Chroma) ne porte
+    # pas narrator dans ses métadonnées (figées au moment de l'embedding, avant l'ajout de
+    # ce champ) — un seul lookup ici couvre les 4 voies (auteur, sémantique, lexical,
+    # thème) sans avoir à modifier chacune de leurs requêtes SQL.
+    narrators = await db.get_narrators([r["story_id"] for r in results])
+    for r in results:
+        r["narrator"] = narrators.get(r["story_id"]) or r["author"]
+
+    return results
 
 
 async def _search_moments(query: str, story_id: int | None, top_k: int) -> list[dict]:
@@ -235,6 +244,7 @@ async def list_stories(args: dict) -> dict:
     stories = await db.sample_stories(limit=limit, offset=offset,
                                        min_duration_seconds=min_seconds, max_duration_seconds=max_seconds,
                                        age_range=age_range, mood=mood)
+    narrators = await db.get_narrators([s["id"] for s in stories])
     actual_range_end = range_start + len(stories) - 1 if stories else range_start
     return {
         "total_stories": total,
@@ -246,6 +256,7 @@ async def list_stories(args: dict) -> dict:
                 "story_id": s["id"],
                 "title": s["title"],
                 "author": s["author"],
+                "narrator": narrators.get(s["id"]) or s["author"],
                 "duration_seconds": s["total_duration_seconds"],
             }
             for s in stories
@@ -290,6 +301,7 @@ async def story_details(args: dict) -> dict:
         "story_id": story["id"],
         "title": story["title"],
         "author": story["author"],
+        "narrator": story["narrator"] or story["author"],
         "long_summary": story["long_summary"],
         "total_duration_seconds": story["total_duration_seconds"],
         "periods": [

@@ -308,6 +308,25 @@ async def get_story(story_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+async def get_narrators(story_ids: list[int]) -> dict[int, str]:
+    """Lookup groupé de stories.narrator (nom confirmé/corrigé, voir init_db) — utilisé
+    par contes_tools pour enrichir a posteriori des résultats venus de sources qui ne
+    portent pas ce champ (Chroma notamment, dont les métadonnées sont figées au moment de
+    l'embedding et n'ont jamais narrator). Ne renvoie que les histoires où narrator est
+    effectivement renseigné : à l'appelant de retomber sur stories.author sinon."""
+    if not story_ids:
+        return {}
+    async with aiosqlite.connect(DB_PATH) as conn:
+        placeholders = ",".join("?" * len(story_ids))
+        async with conn.execute(
+            f"SELECT id, narrator FROM stories WHERE id IN ({placeholders}) "
+            f"AND narrator IS NOT NULL AND narrator != ''",
+            story_ids,
+        ) as cur:
+            rows = await cur.fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 async def get_tracks_for_story(story_id: int) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
