@@ -23,7 +23,15 @@ from . import web_search_client
 
 logger = logging.getLogger(__name__)
 
-MATCH_THRESHOLD = float(os.environ.get("TITLE_RECONCILE_THRESHOLD", "60"))
+MATCH_THRESHOLD = float(os.environ.get("TITLE_RECONCILE_THRESHOLD", "70"))
+# Au-delà d'un certain nombre d'histoires, le risque de confondre deux titres RÉELS mais
+# voisins augmente fortement (observé en pratique sur les 18 Fables de La Fontaine : 'Le
+# Lièvre et la Tortue' réassigné à 'Le Lièvre et les Grenouilles', deux fables distinctes
+# partageant juste le mot 'lièvre') — le matching par similarité de texte seul n'a pas assez
+# de signal pour ça sur un grand recueil aux titres courts et thématiquement proches. Limité
+# aux petits recueils, où ce risque de collision reste faible (validé sur Rue Broca, 13
+# histoires).
+MAX_ANTHOLOGY_SIZE = int(os.environ.get("TITLE_RECONCILE_MAX_SIZE", "15"))
 
 _PLAN_TOOL = [{
     "type": "function",
@@ -92,7 +100,17 @@ _EXTRACT_SYSTEM_PROMPT = (
     "recherche web. RÈGLE ABSOLUE : n'inclus que des titres explicitement listés dans les "
     "rapports fournis — n'invente jamais un titre à partir de connaissances générales, et "
     "ne complète jamais une liste partielle avec des titres plausibles non confirmés par le "
-    "texte. Liste vide si aucune table des matières fiable n'apparaît dans les rapports."
+    "texte. "
+    "MÉFIANCE PARTICULIÈRE (observé en pratique, source d'erreurs) : un rapport peut "
+    "provenir d'une thèse/mémoire universitaire (sommaire académique : 'INTRODUCTION', "
+    "'I. LIRE LES FABLES', 'I.4.1. Le corbeau et le renard et la persuasion'...) ou d'un "
+    "index bibliographique numéroté catalographiant des CENTAINES de contes traditionnels "
+    "sans rapport avec CE recueil précis (ex: '202. La princesse-cane grise' dans un index "
+    "général de contes russes). Ces sommaires/index NE SONT PAS la table des matières du "
+    "recueil audio recherché même s'ils contiennent des mots proches — si le rapport a "
+    "cette forme (numérotation académique du type 'I.4.1.', sections comme "
+    "'INTRODUCTION'/'ANNEXES'/'BIBLIOGRAPHIE', ou une liste numérotée qui dépasse largement "
+    "le nombre d'histoires attendu), réponds liste vide plutôt que d'en extraire des titres."
 )
 
 
@@ -124,6 +142,13 @@ async def _find_anthology_groups(
 async def _reconcile_group(
     conn: aiosqlite.Connection, author: str, base_folder: str, members: list[dict],
 ) -> int:
+    if len(members) > MAX_ANTHOLOGY_SIZE:
+        logger.info(
+            f"reconcile_titles: {base_folder!r} ignoré ({len(members)} histoires > "
+            f"{MAX_ANTHOLOGY_SIZE}, risque de collision entre titres proches trop élevé)"
+        )
+        return 0
+
     literary_author = next((m["literary_author"] for m in members if m.get("literary_author")), "")
     context = (
         f"NOM DE DOSSIER: {base_folder}\n"
