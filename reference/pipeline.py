@@ -9,6 +9,7 @@ from . import duration as duration_stage
 from . import embed as embed_stage
 from . import enrich_web as enrich_web_stage
 from . import identify_speakers as identify_speakers_stage
+from . import reconcile_titles as reconcile_titles_stage
 from . import scan as scan_stage
 from . import split_stories as split_stories_stage
 from . import summarize as summarize_stage
@@ -30,7 +31,7 @@ STAGES = ["scan", "duration", "transcribe", "split_stories", "identify_speakers"
 # (consolidate_themes doit être relancé après tout ajout d'histoires pour que les
 # classes reflètent le catalogue à jour, donc reste un choix explicite).
 EXTRA_STAGES = [
-    "backfill_keywords", "backfill_fts", "enrich_web",
+    "backfill_keywords", "backfill_fts", "enrich_web", "reconcile_titles",
     "classify_traits", "propose_themes", "consolidate_themes", "assign_themes",
 ]
 
@@ -57,6 +58,8 @@ async def run(stage: str, only_new: bool, story_id: int | None, limit: int | Non
         await summarize_stage.backfill_fts(story_id=story_id)
     if stage == "enrich_web":
         await enrich_web_stage.enrich_pending(story_id=story_id, limit=limit)
+    if stage == "reconcile_titles":
+        await reconcile_titles_stage.reconcile_pending(story_id=story_id)
     if stage == "classify_traits":
         await classify_stage.classify_traits_pending(story_id=story_id, limit=limit)
     if stage == "propose_themes":
