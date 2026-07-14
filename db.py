@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
+from rapidfuzz import fuzz, process
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +236,22 @@ async def find_story_id_by_title(title_query: str) -> int | None:
             (f"%{title_query}%",),
         ) as cur:
             row = await cur.fetchone()
-    return row["id"] if row else None
+        if row:
+            return row["id"]
+
+        # Repli tolérant aux variantes orthographiques (ex: 'Renard' deviné par le LLM
+        # pour le titre réel 'Le Roman De Renart') — le LIKE ci-dessus est un substring
+        # exact, insuffisant pour ce cas. rapidfuzz sur les titres normalisés (accents/
+        # casse) trouve la meilleure correspondance ; seuil calibré pour tolérer une
+        # faute/variante ponctuelle sans matcher un titre sans rapport.
+        async with conn.execute("SELECT id, title FROM stories WHERE status = 'ready'") as cur:
+            all_stories = await cur.fetchall()
+    if not all_stories:
+        return None
+    norm_query = normalize_text(title_query)
+    choices = {s["id"]: normalize_text(s["title"]) for s in all_stories}
+    match = process.extractOne(norm_query, choices, scorer=fuzz.ratio, score_cutoff=70)
+    return match[2] if match else None
 
 
 async def get_story(story_id: int) -> dict | None:

@@ -2,6 +2,7 @@ git+https://github.com/FCare/nexus-client.git@master
 fastapi>=0.110.0
 uvicorn>=0.29.0
 aiosqlite>=0.19.0
+rapidfuzz>=3.0.0
 chromadb>=0.5.0
 sentence-transformers>=3.0.0
 openai>=1.0.0
