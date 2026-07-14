@@ -9,8 +9,10 @@ from . import duration as duration_stage
 from . import embed as embed_stage
 from . import enrich_web as enrich_web_stage
 from . import identify_speakers as identify_speakers_stage
+from . import narrator_identity as narrator_identity_stage
 from . import reconcile_titles as reconcile_titles_stage
 from . import scan as scan_stage
+from . import speaker_voice_eval as speaker_voice_eval_stage
 from . import split_stories as split_stories_stage
 from . import summarize as summarize_stage
 from . import transcribe as transcribe_stage
@@ -33,6 +35,17 @@ STAGES = ["scan", "duration", "transcribe", "split_stories", "identify_speakers"
 EXTRA_STAGES = [
     "backfill_keywords", "backfill_fts", "enrich_web", "reconcile_titles",
     "classify_traits", "propose_themes", "consolidate_themes", "assign_themes",
+    # Expérimental, hors production : compare le mapping locuteur actuel (LLM sur le
+    # texte du transcript, retenu comme référence) à une approche alternative par
+    # empreinte vocale ECAPA-TDNN — voir reference/speaker_voice_eval.py. Choix explicite
+    # uniquement, jamais un effet de bord de "all".
+    "eval_speaker_voice",
+    # Suite de eval_speaker_voice : déduit une identité de narrateur par cluster acoustique
+    # via LLM, et pousse le résultat en production sur stories.narrator quand la confiance
+    # est haute — voir reference/narrator_identity.py. Choix explicite, jamais un effet de
+    # bord de "all" ni de "eval_speaker_voice" (dépend de son cache d'embeddings mais reste
+    # une étape distincte, ré-exécutable indépendamment).
+    "narrator_identity",
 ]
 
 
@@ -68,6 +81,12 @@ async def run(stage: str, only_new: bool, story_id: int | None, limit: int | Non
         await classify_stage.consolidate_theme_classes()
     if stage == "assign_themes":
         await classify_stage.assign_theme_classes_pending(story_id=story_id, limit=limit)
+    if stage == "eval_speaker_voice":
+        result = await speaker_voice_eval_stage.run(limit=limit)
+        logger.info(f"eval_speaker_voice: {result}")
+    if stage == "narrator_identity":
+        result = await narrator_identity_stage.run()
+        logger.info(f"narrator_identity: {result}")
 
 
 def main() -> None:

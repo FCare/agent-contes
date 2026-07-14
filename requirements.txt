@@ -9,3 +9,5 @@ openai>=1.0.0
 mutagen>=1.47.0
 python-multipart>=0.0.9
 whisperx>=3.3.0
+speechbrain>=1.0.0
+scipy>=1.10.0

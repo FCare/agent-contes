@@ -142,6 +142,52 @@ async def init_db() -> None:
                 theme_class_id INTEGER NOT NULL REFERENCES theme_classes(id) ON DELETE CASCADE,
                 PRIMARY KEY (story_id, theme_class_id)
             );
+
+            -- Cache expérimental pour reference.speaker_voice_eval : registre de voix par
+            -- empreinte ECAPA-TDNN, EN PLUS du mapping locuteur actuel (LLM sur le texte du
+            -- transcript, qui reste la référence en production). Granularité = l'unité
+            -- atomique d'une vraie voix physique : (track_id, speaker_label), PAS toute une
+            -- histoire — la diarization tourne piste par piste, donc un même personnage
+            -- ('Narrateur' notamment) peut recouvrir plusieurs voix distinctes selon la
+            -- piste. Le clustering (voir cluster_voices) se fait UNIQUEMENT sur ces
+            -- embeddings, sans utiliser stories.author ni character_name — ces infos ne
+            -- servent qu'à ANNOTER un cluster après coup, jamais à le construire.
+            CREATE TABLE IF NOT EXISTS eval_voice_embeddings (
+                story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+                track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+                speaker_label TEXT NOT NULL,
+                character_name TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                seconds REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (story_id, track_id, speaker_label)
+            );
+
+            -- Résultat expérimental de reference.narrator_identity : une identité déduite
+            -- par LLM à partir des chemins de fichiers d'un cluster acoustique (voir
+            -- eval_voice_embeddings / cluster_voices). Table intégralement remplacée à
+            -- chaque exécution (DELETE puis réinsertion) — le clustering n'étant pas
+            -- stable d'une run à l'autre (seuil, catalogue qui grandit), la conserver
+            -- entre deux runs n'aurait pas de sens. Quand confidence='haute', la même
+            -- exécution met aussi à jour stories.narrator (voir narrator_identity.run) :
+            -- cette table garde la trace complète (raisonnement, membres, seuil) même
+            -- pour les identités à confiance faible qu'on ne pousse jamais en production.
+            CREATE TABLE IF NOT EXISTS narrator_identities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                inferred_name TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                is_professional INTEGER NOT NULL,
+                reasoning TEXT NOT NULL,
+                cluster_threshold REAL NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS narrator_identity_members (
+                identity_id INTEGER NOT NULL REFERENCES narrator_identities(id) ON DELETE CASCADE,
+                story_id INTEGER NOT NULL,
+                track_id INTEGER NOT NULL,
+                speaker_label TEXT NOT NULL,
+                PRIMARY KEY (story_id, track_id, speaker_label)
+            );
         """)
 
         async with db.execute("PRAGMA table_info(speaker_map)") as cur:
