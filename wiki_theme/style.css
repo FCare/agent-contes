@@ -1,0 +1,9 @@
+/* Material a déjà un mécanisme scroll-margin-top intégré, mais insuffisant ici
+   (.md-typeset :target { --md-scroll-margin: 3.6rem; ... }, voir main.*.min.css) : un
+   lien vers #periode-54 atterrit sous le header sticky, donnant l'impression d'être
+   sur le chapitre suivant. On surcharge la variable plutôt que scroll-margin-top
+   directement — même sélecteur que Material (.md-typeset :target, spécificité
+   égale), sinon un sélecteur plus simple comme "h3[id]" perd face au sien. */
+.md-typeset :target {
+  --md-scroll-margin: 10rem;
+}

@@ -188,6 +188,26 @@ async def init_db() -> None:
                 speaker_label TEXT NOT NULL,
                 PRIMARY KEY (story_id, track_id, speaker_label)
             );
+
+            -- Casting de référence, IMMUABLE par le clustering acoustique
+            -- (reference.narrator_identity, voir narrator_identities ci-dessus, qui
+            -- DELETE + reconstruit tout à chaque exécution). Priorité de confiance
+            -- des sources, de la plus à la moins fiable : 'human' (confirmé par un
+            -- humain) > 'id3_metadata' (tag TPE1 des fichiers) > 'artwork_vision'
+            -- (LLM vision sur la pochette embarquée, si présente). Une fois qu'une
+            -- histoire a une entrée ici, le clustering acoustique ne doit plus jamais
+            -- l'écraser (voir reference/narrator_identity.py::run, filtré sur cette
+            -- table) ni story_details ne doit préférer les résultats de
+            -- get_voices_for_story() aux entrées 'human'/'id3_metadata' d'ici.
+            CREATE TABLE IF NOT EXISTS story_cast_verified (
+                story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                role TEXT,
+                is_narrator INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'human',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (story_id, name)
+            );
         """)
 
         async with db.execute("PRAGMA table_info(speaker_map)") as cur:
@@ -308,6 +328,13 @@ async def get_story(story_id: int) -> dict | None:
     return dict(row) if row else None
 
 
+async def get_all_story_ids() -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute("SELECT id FROM stories ORDER BY id") as cur:
+            rows = await cur.fetchall()
+    return [r[0] for r in rows]
+
+
 async def get_narrator_info(story_ids: list[int]) -> dict[int, dict]:
     """Lookup groupé de stories.narrator (qui LIT l'histoire, confirmé/corrigé par
     narrator_identity.py) et stories.literary_author (qui a ÉCRIT l'histoire à l'origine,
@@ -332,6 +359,124 @@ async def get_narrator_info(story_ids: list[int]) -> dict[int, dict]:
         r[0]: {"narrator": r[1] or None, "literary_author": r[2] or None}
         for r in rows
     }
+
+
+async def get_voices_for_story(story_id: int) -> list[dict]:
+    """Voix distinctes détectées dans l'enregistrement (narrator_identities/
+    narrator_identity_members, clustering acoustique expérimental — voir
+    reference.narrator_identity). Une histoire peut avoir plusieurs interprètes
+    (narrateur + personnages), contrairement à stories.narrator qui ne retient
+    qu'un seul nom (le plus probable) — voir get_narrator_info. Confidence
+    'faible' exclue (bruit connu du clustering) ainsi que les entrées sans nom
+    propre exploitable ('Indéterminé', 'Inconnu...', 'Non identifiable...').
+    Ces tables sont intégralement reconstruites à chaque exécution du script de
+    clustering (non stables d'une run à l'autre) et peuvent être vides si
+    jamais exécuté pour cette histoire — liste retournée non garantie
+    exhaustive, seulement les voix identifiées avec une confiance suffisante."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            """
+            SELECT DISTINCT ni.inferred_name, ni.confidence
+            FROM narrator_identity_members nim
+            JOIN narrator_identities ni ON ni.id = nim.identity_id
+            WHERE nim.story_id = ? AND ni.confidence IN ('haute', 'moyenne')
+            ORDER BY CASE ni.confidence WHEN 'haute' THEN 0 ELSE 1 END, ni.inferred_name
+            """,
+            (story_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    seen = set()
+    voices = []
+    for r in rows:
+        name = (r["inferred_name"] or "").strip()
+        lowered = name.lower()
+        if not name or name in seen or "inconnu" in lowered or "indétermin" in lowered or "non identifi" in lowered:
+            continue
+        seen.add(name)
+        voices.append({"name": name, "confidence": r["confidence"]})
+    return voices
+
+
+_SOURCE_PRIORITY = {"human": 0, "id3_metadata": 1, "artwork_vision": 2}
+
+
+async def get_verified_cast(story_id: int) -> list[dict]:
+    """Casting de référence immuable pour une histoire (voir story_cast_verified) -
+    jamais touché par le clustering acoustique. Trié par fiabilité de source puis
+    narrateur d'abord."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT name, role, is_narrator, source FROM story_cast_verified WHERE story_id = ?",
+            (story_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    entries = [dict(r) for r in rows]
+    entries.sort(key=lambda e: (_SOURCE_PRIORITY.get(e["source"], 9), not e["is_narrator"], e["name"]))
+    return entries
+
+
+async def get_verified_cast_bulk(story_ids: list[int]) -> dict[int, list[dict]]:
+    """Version groupée de get_verified_cast, pour enrichir une liste de résultats de
+    recherche (search_contes) sans un aller-retour DB par histoire - voir
+    contes_tools._search_stories, qui expose ainsi 'voices' même sur le chemin de repli
+    utilisé quand le LLM appelant omet 'type' (voir dispatch, story_details non atteint
+    dans ce cas)."""
+    if not story_ids:
+        return {}
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        placeholders = ",".join("?" * len(story_ids))
+        async with conn.execute(
+            f"SELECT story_id, name, role, is_narrator, source FROM story_cast_verified "
+            f"WHERE story_id IN ({placeholders})",
+            story_ids,
+        ) as cur:
+            rows = await cur.fetchall()
+    by_story: dict[int, list[dict]] = {}
+    for r in rows:
+        by_story.setdefault(r["story_id"], []).append(
+            {"name": r["name"], "role": r["role"], "is_narrator": r["is_narrator"], "source": r["source"]}
+        )
+    for sid, entries in by_story.items():
+        entries.sort(key=lambda e: (_SOURCE_PRIORITY.get(e["source"], 9), not e["is_narrator"], e["name"]))
+    return by_story
+
+
+async def has_verified_cast(story_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute(
+            "SELECT 1 FROM story_cast_verified WHERE story_id = ? LIMIT 1", (story_id,)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+
+async def add_verified_cast_member(
+    story_id: int, name: str, role: str | None, is_narrator: bool, source: str
+) -> None:
+    """Ajoute/replace une entrée de casting de référence. Ne dégrade jamais une
+    source plus fiable déjà en place (ex: 'human' n'est jamais écrasé par
+    'id3_metadata' pour le même nom) — voir _SOURCE_PRIORITY."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute(
+            "SELECT source FROM story_cast_verified WHERE story_id = ? AND name = ?",
+            (story_id, name),
+        ) as cur:
+            existing = await cur.fetchone()
+        if existing and _SOURCE_PRIORITY.get(existing[0], 9) < _SOURCE_PRIORITY.get(source, 9):
+            return
+        await conn.execute(
+            "INSERT INTO story_cast_verified (story_id, name, role, is_narrator, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(story_id, name) DO UPDATE SET "
+            "role = excluded.role, is_narrator = excluded.is_narrator, "
+            "source = excluded.source, created_at = excluded.created_at",
+            (story_id, name, role, int(is_narrator), source, now),
+        )
+        await conn.commit()
 
 
 async def get_tracks_for_story(story_id: int) -> list[dict]:
@@ -692,6 +837,44 @@ async def stories_by_theme_class(class_id: int, limit: int = 20) -> list[dict]:
         ) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def all_ready_stories() -> list[dict]:
+    """Toutes les colonnes, pour tout le catalogue 'ready' — utilisé par
+    reference.build_wiki qui a besoin de l'ensemble des champs (folder_path,
+    age_range, mood_tags...) pour générer une fiche complète par histoire,
+    contrairement à sample_stories (pagination utilisateur, colonnes réduites)."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT * FROM stories WHERE status = 'ready' ORDER BY title"
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_theme_classes_bulk(story_ids: list[int]) -> dict[int, list[dict]]:
+    """Version groupée de stories_by_theme_class, dans l'autre sens (histoire -> ses
+    thèmes) — même esprit que get_verified_cast_bulk, pour éviter un aller-retour DB
+    par histoire lors d'une génération en masse (reference.build_wiki)."""
+    if not story_ids:
+        return {}
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        placeholders = ",".join("?" * len(story_ids))
+        async with conn.execute(
+            f"SELECT stc.story_id, tc.id, tc.label, tc.description FROM story_theme_classes stc "
+            f"JOIN theme_classes tc ON tc.id = stc.theme_class_id "
+            f"WHERE stc.story_id IN ({placeholders}) ORDER BY tc.label",
+            story_ids,
+        ) as cur:
+            rows = await cur.fetchall()
+    by_story: dict[int, list[dict]] = {}
+    for r in rows:
+        by_story.setdefault(r["story_id"], []).append(
+            {"id": r["id"], "label": r["label"], "description": r["description"]}
+        )
+    return by_story
 
 
 async def list_stories_by_author(author_query: str, limit: int = 10) -> list[dict]:

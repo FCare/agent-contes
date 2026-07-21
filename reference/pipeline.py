@@ -4,10 +4,12 @@ import logging
 import sys
 
 import db
+from . import build_wiki as build_wiki_stage
 from . import classify as classify_stage
 from . import duration as duration_stage
 from . import embed as embed_stage
 from . import enrich_web as enrich_web_stage
+from . import extract_cast_from_media as extract_cast_stage
 from . import identify_speakers as identify_speakers_stage
 from . import narrator_identity as narrator_identity_stage
 from . import reconcile_titles as reconcile_titles_stage
@@ -33,7 +35,7 @@ STAGES = ["scan", "duration", "transcribe", "split_stories", "identify_speakers"
 # (consolidate_themes doit être relancé après tout ajout d'histoires pour que les
 # classes reflètent le catalogue à jour, donc reste un choix explicite).
 EXTRA_STAGES = [
-    "backfill_keywords", "backfill_fts", "enrich_web", "reconcile_titles",
+    "backfill_keywords", "backfill_fts", "backfill_segment_embeddings", "enrich_web", "reconcile_titles",
     "classify_traits", "propose_themes", "consolidate_themes", "assign_themes",
     # Expérimental, hors production : compare le mapping locuteur actuel (LLM sur le
     # texte du transcript, retenu comme référence) à une approche alternative par
@@ -44,8 +46,21 @@ EXTRA_STAGES = [
     # via LLM, et pousse le résultat en production sur stories.narrator quand la confiance
     # est haute — voir reference/narrator_identity.py. Choix explicite, jamais un effet de
     # bord de "all" ni de "eval_speaker_voice" (dépend de son cache d'embeddings mais reste
-    # une étape distincte, ré-exécutable indépendamment).
+    # une étape distincte, ré-exécutable indépendamment). Exclut automatiquement les
+    # histoires à casting de référence vérifié (voir extract_cast_media ci-dessous).
     "narrator_identity",
+    # Casting de référence extrait des tags ID3 (TPE1)/artwork embarqué - voir
+    # reference/extract_cast_from_media.py. Source plus fiable que le clustering
+    # acoustique quand disponible (texte structuré plutôt qu'inférence), et surtout
+    # IMMUABLE : une fois une histoire traitée ici, narrator_identity ne la touche
+    # plus jamais. Choix explicite, jamais un effet de bord de "all".
+    "extract_cast_media",
+    # Génère le wiki statique (voir reference/build_wiki.py) depuis l'état actuel
+    # de la base — aucun coût LLM, régénération complète à chaque exécution.
+    # Aussi appelée automatiquement en fin de synchro quotidienne (main.py,
+    # _daily_catalog_sync_loop), donc rejouable manuellement ici pour un
+    # rebuild à la demande sans attendre la prochaine synchro.
+    "build_wiki",
 ]
 
 
@@ -69,6 +84,9 @@ async def run(stage: str, only_new: bool, story_id: int | None, limit: int | Non
         await summarize_stage.backfill_keywords(story_id=story_id)
     if stage == "backfill_fts":
         await summarize_stage.backfill_fts(story_id=story_id)
+    if stage == "backfill_segment_embeddings":
+        result = await embed_stage.backfill_segment_embeddings(story_id=story_id)
+        logger.info(f"backfill_segment_embeddings: {result}")
     if stage == "enrich_web":
         await enrich_web_stage.enrich_pending(story_id=story_id, limit=limit)
     if stage == "reconcile_titles":
@@ -87,6 +105,12 @@ async def run(stage: str, only_new: bool, story_id: int | None, limit: int | Non
     if stage == "narrator_identity":
         result = await narrator_identity_stage.run()
         logger.info(f"narrator_identity: {result}")
+    if stage == "extract_cast_media":
+        result = await extract_cast_stage.run(story_id=story_id, limit=limit)
+        logger.info(f"extract_cast_media: {result}")
+    if stage == "build_wiki":
+        result = await build_wiki_stage.run()
+        logger.info(f"build_wiki: {result}")
 
 
 def main() -> None:

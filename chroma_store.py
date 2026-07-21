@@ -127,6 +127,40 @@ def upsert_period(story_id: int, period_index: int, global_start_seconds: float,
         logger.error(f"ChromaDB upsert period failed (story {story_id}, period {period_index}): {e}")
 
 
+def upsert_segments(story_id: int, segments: list[dict]) -> None:
+    """Granularité la plus fine de recherche : un segment = une phrase transcrite
+    (voir transcript_segments), pas une fenêtre de ~3 min comme period_summary/
+    period_transcript. Permet de retrouver un moment PRÉCIS ("le moment où il parle
+    à la reine") plutôt que seulement la période qui le contient — voir
+    search_moments, qui interroge cette granularité en plus des périodes, laissant
+    le score de similarité départager naturellement précision vs contexte plus large.
+    Un seul upsert batché par histoire (~150-200 segments), pas un appel par segment.
+    segments = [{"segment_id", "text", "global_start_seconds", "global_end_seconds",
+    "speaker"}, ...] (voir reference/embed.py::_get_story_segments)."""
+    if not segments:
+        return
+    try:
+        col = _collection_handle()
+        ids, docs, metas = [], [], []
+        for s in segments:
+            if not s.get("text"):
+                continue
+            ids.append(_id("segment", str(story_id), str(s["segment_id"])))
+            docs.append(s["text"])
+            metas.append({
+                "kind": "segment_transcript",
+                "story_id": story_id,
+                "period_index": -1,
+                "global_start_seconds": s["global_start_seconds"],
+                "global_end_seconds": s["global_end_seconds"],
+                "speaker": s.get("speaker") or "",
+            })
+        if ids:
+            col.upsert(ids=ids, documents=docs, metadatas=metas)
+    except Exception as e:
+        logger.error(f"ChromaDB upsert segments failed (story {story_id}): {e}")
+
+
 def upsert_theme_class(class_id: int, label: str, description: str) -> None:
     """Classe thématique 'libre' (découverte depuis le contenu, pas un vocabulaire fixé
     à l'avance) — embeddée séparément pour router une requête libre ('des histoires de
@@ -201,12 +235,16 @@ def search_stories(query: str, n_results: int = 5,
 
 
 def search_moments(query: str, story_id: int | None = None, n_results: int = 5) -> list[dict]:
+    """Interroge à la fois les périodes (~3 min, plus de contexte thématique) et les
+    segments individuels (une phrase, précision maximale — voir upsert_segments) :
+    laisse le score de similarité départager naturellement selon la requête, plutôt
+    que de choisir une seule granularité a priori."""
     try:
         col = _collection_handle()
         count = col.count()
         if count == 0:
             return []
-        where: dict = {"kind": {"$in": ["period_summary", "period_transcript"]}}
+        where: dict = {"kind": {"$in": ["period_summary", "period_transcript", "segment_transcript"]}}
         if story_id is not None:
             where = {"$and": [where, {"story_id": story_id}]}
         results = col.query(query_texts=[query], n_results=min(n_results, count), where=where)

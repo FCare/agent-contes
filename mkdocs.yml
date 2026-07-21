@@ -1,0 +1,66 @@
+site_name: Contes — Wiki
+site_description: Catalogue de contes audio — histoires, voix, thèmes, recherche sémantique
+docs_dir: /wiki/src
+site_dir: /wiki/site
+
+theme:
+  name: material
+  language: fr
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+  features:
+    - navigation.indexes
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+
+# Ordre explicite plutôt que la dérivation auto (par défaut alphabétique sur les
+# noms de dossiers, pas forcément le bon ordre de navigation) — aligné sur l'ordre
+# de la section "Explorer par..." de l'accueil (voir _render_index_page). Ne liste
+# que les pages d'index de chaque section : les fiches individuelles (histoire,
+# thème, voix...) restent atteignables par lien sans encombrer le menu latéral de
+# centaines d'entrées.
+nav:
+  - Accueil: index.md
+  - Toutes les histoires: histoires/index.md
+  - Thèmes: themes/index.md
+  - Tranche d'âge: ages/index.md
+  - Ambiances: ambiances/index.md
+  - Durées: durees/index.md
+  - Toutes les voix: voix/index.md
+  - Personnages: personnages/index.md
+  - Recueils: recueils/index.md
+
+# Sans ça, MkDocs logue une alerte listant individuellement chaque fiche
+# histoire/thème/voix/personnage/recueil (~850 lignes) à chaque génération —
+# attendu par construction (nav volontairement limité aux pages d'index
+# ci-dessus, voir le commentaire sur `nav`), pas une vraie anomalie à surveiller.
+not_in_nav: |
+  histoires/*.md
+  recueils/*.md
+  themes/*.md
+  voix/*.md
+  personnages/*.md
+  ages/*.md
+  ambiances/*.md
+  durees/*.md
+
+extra_css:
+  - assets/style.css
+
+extra_javascript:
+  - assets/search.js
+  - assets/playlist.js
+
+markdown_extensions:
+  - attr_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.superfences
+
+# docs_dir/site_dir ci-dessus sont les défauts (utiles pour `mkdocs serve` en
+# local) — reference/build_wiki.py les surcharge explicitement via
+# WIKI_SRC_DIR/WIKI_SITE_DIR à chaque appel de load_config().

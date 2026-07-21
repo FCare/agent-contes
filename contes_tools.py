@@ -141,11 +141,19 @@ async def _search_stories(query: str, top_k: int, min_minutes, max_minutes) -> l
     # "author" (brut, ambigu) ne sort jamais tel quel : replié dans literary_author
     # seulement si l'enrichissement web n'a rien trouvé, jamais dans narrator.
     info = await db.get_narrator_info([r["story_id"] for r in results])
+    # Casting vérifié (voir story_details) exposé aussi ici : le LLM appelant omet
+    # parfois 'type' sur une relance et retombe sur ce chemin (voir dispatch) sans
+    # jamais atteindre story_details - sans ce champ, il n'a alors aucun moyen de
+    # répondre correctement à une question sur "les voix"/"les personnages" et
+    # invente une réponse à partir du seul résumé (halluciné, cas observé en
+    # pratique : personnages de l'histoire confondus avec des noms d'interprètes).
+    cast = await db.get_verified_cast_bulk([r["story_id"] for r in results])
     for r in results:
         entry = info.get(r["story_id"], {})
         author = r.pop("author")
         r["narrator"] = entry.get("narrator")
         r["literary_author"] = entry.get("literary_author") or author
+        r["voices"] = [c["name"] for c in cast.get(r["story_id"], [])] or None
 
     return results
 
@@ -302,6 +310,23 @@ async def story_details(args: dict) -> dict:
         return {"error": "histoire introuvable"}
     periods = await db.get_periods_for_story(story_id)
     bookmark = await db.get_bookmark(story_id)
+
+    # Le casting de référence (story_cast_verified — humain ou extrait des tags
+    # ID3/artwork, voir db.add_verified_cast_member) est IMMUABLE et prioritaire
+    # sur le clustering acoustique expérimental (get_voices_for_story, réécrit à
+    # chaque exécution de reference/narrator_identity.py, voir sa docstring).
+    verified = await db.get_verified_cast(story_id)
+    if verified:
+        narrator_verified = next((c["name"] for c in verified if c["is_narrator"]), None)
+        narrator = narrator_verified or story["narrator"] or None
+        voices = [
+            {"name": c["name"], "role": c["role"], "confidence": "vérifié"}
+            for c in verified
+        ]
+    else:
+        narrator = story["narrator"] or None
+        voices = await db.get_voices_for_story(story_id)
+
     return {
         "story_id": story["id"],
         "title": story["title"],
@@ -309,7 +334,14 @@ async def story_details(args: dict) -> dict:
         # deviner). literary_author = qui l'a ÉCRITE ; repli sur le champ brut du
         # catalogue (stories.author) seulement si l'enrichissement web n'a rien trouvé —
         # jamais réutilisé comme repli pour narrator (l'un ne prouve pas l'autre).
-        "narrator": story["narrator"] or None,
+        "narrator": narrator,
+        # voices = TOUTES les voix distinctes de l'enregistrement (narrateur +
+        # personnages), contrairement à narrator qui n'en retient qu'une seule.
+        # Vient de story_cast_verified (confidence="vérifié") si disponible pour
+        # cette histoire, sinon du clustering acoustique expérimental (voir
+        # db.get_voices_for_story, non stable d'une exécution à l'autre) — liste
+        # possiblement vide, ne pas l'interpréter comme "narrateur unique confirmé".
+        "voices": voices,
         "literary_author": story["literary_author"] or story["author"],
         "long_summary": story["long_summary"],
         "total_duration_seconds": story["total_duration_seconds"],

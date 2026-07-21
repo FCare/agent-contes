@@ -8,12 +8,15 @@ from zoneinfo import ZoneInfo
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from nexus_client import NexusClient
 
 import contes_tools
 import db
 import playlist
+import wiki_api
+from reference import build_wiki as build_wiki_stage
 from reference import classify
 from reference import pipeline as pipeline_stage
 from reference import scan as scan_stage
@@ -37,6 +40,18 @@ _subscribed_sessions: set[str] = set()
 DAILY_ORPHAN_CHECK_HOUR = int(os.environ.get("DAILY_ORPHAN_CHECK_HOUR", "4"))  # heure locale Europe/Paris
 
 app = FastAPI(title="contes-agent")
+app.include_router(wiki_api.router)
+if build_wiki_stage.WIKI_SITE_DIR.is_dir():
+    # Monté seulement si le site a déjà été généré au moins une fois (sinon
+    # StaticFiles refuse de démarrer, faisant planter tout l'agent au boot) —
+    # voir build_wiki_stage.run(), appelé chaque nuit par _daily_catalog_sync_loop
+    # ou manuellement via `python -m reference.pipeline --stage build_wiki`.
+    app.mount("/wiki", StaticFiles(directory=build_wiki_stage.WIKI_SITE_DIR, html=True), name="wiki")
+else:
+    logger.warning(
+        f"Wiki pas encore généré ({build_wiki_stage.WIKI_SITE_DIR} introuvable) — "
+        "/wiki indisponible tant que build_wiki n'a pas tourné au moins une fois"
+    )
 
 
 async def _daily_catalog_sync_loop() -> None:
@@ -66,6 +81,14 @@ async def _daily_catalog_sync_loop() -> None:
             logger.info(f"Vérification orphelins terminée: {result}")
         except Exception as e:
             logger.error(f"Vérification orphelins échouée: {e}")
+        try:
+            result = await build_wiki_stage.run()
+            logger.info(f"Régénération du wiki terminée: {result}")
+        except Exception as e:
+            # Un échec de génération du wiki ne doit jamais faire échouer la synchro
+            # du catalogue elle-même (résultat déjà acquis avant ce bloc) — le wiki
+            # reste simplement à sa dernière version générée avec succès.
+            logger.error(f"Régénération du wiki échouée: {e}")
 
 
 @app.get("/health")
@@ -73,11 +96,26 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/")
+async def root():
+    # Le site généré vit sous /wiki (voir le mount StaticFiles ci-dessus) — sans
+    # cette redirection, contes.caronboulme.fr/ (ce que tape naturellement un
+    # utilisateur) renvoie 404, seul /wiki/ répond.
+    return RedirectResponse(url="/wiki/")
+
+
 _MEDIA_TYPES = {".mp3": "audio/mpeg", ".ogg": "audio/ogg"}
 
 
-@app.get("/stream/{track_id}")
+@app.get("/stream/{track_id:int}")
 async def stream_track(track_id: int):
+    # Le convertisseur ":int" explicite (syntaxe Starlette, pas seulement
+    # l'annotation Python) est nécessaire pour que /stream/{slug} ci-dessous
+    # reçoive bien les requêtes dont le segment n'est PAS un entier — sans lui,
+    # Starlette matche cette route pour tout segment (conversion en int tentée
+    # ensuite par FastAPI/Pydantic) et renvoie 422 au lieu d'essayer la route
+    # suivante. Route inchangée par ailleurs, utilisée telle quelle côté MQTT
+    # (contes_tools.get_playlist génère /stream/{id}).
     track = await db.get_track(track_id)
     if not track:
         raise HTTPException(404, "Piste introuvable")
@@ -86,6 +124,23 @@ async def stream_track(track_id: int):
         raise HTTPException(404, "Fichier introuvable sur disque")
     media_type = _MEDIA_TYPES.get(abs_path.suffix.lower(), "application/octet-stream")
     return FileResponse(abs_path, media_type=media_type)
+
+
+@app.get("/stream/{slug}")
+async def stream_by_slug(slug: str):
+    """URL de streaming expressive (titre de l'histoire, voir
+    reference/build_wiki.py::_track_stream_url/parse_stream_slug), ex:
+    /stream/palomita-13 ou /stream/alice-au-pays-des-merveilles-4-piste-2 —
+    seule /stream/{track_id:int} ci-dessus reste utilisée côté MQTT."""
+    parsed = build_wiki_stage.parse_stream_slug(slug)
+    if not parsed:
+        raise HTTPException(404, "Piste introuvable")
+    story_id, piste = parsed
+    tracks = await db.get_tracks_for_story(story_id)
+    track = next((t for t in tracks if t["order_index"] == piste - 1), None)
+    if not track:
+        raise HTTPException(404, "Piste introuvable")
+    return await stream_track(track["id"])
 
 
 @app.get("/playlist/{story_id}")
@@ -163,7 +218,9 @@ _RESULT_DESCRIPTION = (
     "valides, aucun n'est de moindre qualité. Si les deux champs sont vides, alors "
     "seulement il n'y a aucune correspondance. "
     "'narrator'=qui LIT l'histoire (null si inconnu, ne pas deviner), "
-    "'literary_author'=qui l'a ÉCRITE. "
+    "'literary_author'=qui l'a ÉCRITE, 'voices'=TOUTES les voix distinctes détectées "
+    "(narrateur ET personnages, null si aucune) — à utiliser pour toute question sur "
+    "'les voix'/'qui raconte' même sans appeler story_details séparément. "
     "list_stories → 'stories' (au plus 15, titre/narrator/literary_author/durée), "
     "'total_stories' (nombre réel total pour les critères donnés), 'range_start'/"
     "'range_end' (bornes effectivement renvoyées), 'truncated' (true s'il reste des "
@@ -175,7 +232,13 @@ _RESULT_DESCRIPTION = (
     "list_themes → 'themes' (label + description de chaque classe thématique du "
     "catalogue) — s'en servir pour suggérer des pistes concrètes à l'utilisateur. "
     "story_details → narrator/literary_author (voir distinction ci-dessus), résumé, "
-    "durée, découpage par période. "
+    "durée, découpage par période, ET 'voices' (liste de {name, confidence}) — TOUTES "
+    "les voix distinctes détectées dans l'enregistrement (narrateur ET personnages, "
+    "un enregistrement a souvent plusieurs interprètes), à utiliser pour toute question "
+    "sur 'les voix'/'qui raconte'/'les différents narrateurs' plutôt que le seul champ "
+    "narrator qui n'en retient qu'un ; liste possiblement vide (clustering jamais "
+    "exécuté ou rien trouvé avec confiance suffisante), ne pas la confondre avec "
+    "'un seul narrateur confirmé'. "
     "get_playlist → tracks (liste ordonnée d'URLs de pistes à streamer en HTTP), "
     "start_index (index de la piste de départ dans 'tracks'), start_offset_seconds "
     "(temps de départ dans cette piste) — à transmettre tel quel au lecteur audio local. "
@@ -253,13 +316,26 @@ async def on_user_connected(topic: str, payload) -> None:
 
     async def on_contes_request(t: str, p) -> None:
         if not isinstance(p, dict):
+            logger.warning(f"[{username}] Requête contes ignorée: payload non-dict: {p!r}")
+            await nexus.publish(result_topic, {"error": "invalid request payload: expected a JSON object"})
             return
-        req_type = p.get("type", "").strip()
-        logger.info(f"[{username}] Requête contes: {p}")
-        result = await contes_tools.dispatch(req_type, p)
         reply_to = p.get("reply_to", result_topic)
-        await nexus.publish(reply_to, result)
-        logger.info(f"[{username}] Réponse contes publiée sur {reply_to}")
+        try:
+            req_type = p.get("type", "")
+            if not isinstance(req_type, str):
+                req_type = str(req_type)
+            req_type = req_type.strip()
+            logger.info(f"[{username}] Requête contes: {p}")
+            result = await contes_tools.dispatch(req_type, p)
+            await nexus.publish(reply_to, result)
+            logger.info(f"[{username}] Réponse contes publiée sur {reply_to}")
+        except Exception as e:
+            # nexus_client._on_message dispatche les callbacks coroutine via
+            # asyncio.run_coroutine_threadsafe sans jamais attendre/vérifier le résultat :
+            # toute exception non catchée ici serait silencieusement avalée, laissant
+            # l'appelant (LLM côté panoramix/joshua) bloqué indéfiniment sur reply_to.
+            logger.error(f"[{username}] on_contes_request a échoué: {e}")
+            await nexus.publish(reply_to, {"error": f"internal error: {e}"})
 
     nexus.subscribe(request_topic, on_contes_request)
     nexus.start_listening()

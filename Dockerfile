@@ -9,6 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py .
 COPY reference/ reference/
+COPY mkdocs.yml .
+COPY wiki_theme/ wiki_theme/
 
 ENV PYTHONUNBUFFERED=1
 

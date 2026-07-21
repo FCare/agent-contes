@@ -198,16 +198,29 @@ async def _resolve(
     return leaves
 
 
-async def _persist_leaf(conn: aiosqlite.Connection, leaf: dict, threshold: float) -> int:
+async def _persist_leaf(
+    conn: aiosqlite.Connection, leaf: dict, threshold: float, verified_story_ids: set[int]
+) -> int:
     """Insère UNE identité déduite et, si confiance haute, pousse en production sur
     stories.narrator (écrase une valeur existante : voir décision explicite — le clustering
     acoustique fait foi sur CE fichier précis, une valeur déjà présente peut venir d'un
     enrichissement web qui s'est trompé d'édition/support, cas observé sur Le_BGG). Commit
     immédiat par leaf plutôt qu'en fin de run entier : un run porte sur ~200+ clusters et
     autant d'appels LLM, un seul échec (réseau, réponse malformée) en cours de route ne doit
-    pas faire perdre tout le travail déjà accompli avant lui."""
+    pas faire perdre tout le travail déjà accompli avant lui.
+
+    verified_story_ids exclut les histoires ayant un casting de référence IMMUABLE (voir
+    db.story_cast_verified, alimenté manuellement ou via reference/extract_cast_from_media.py) :
+    ni leurs membres ni leur stories.narrator ne doivent être touchés par le clustering
+    acoustique, même si l'identité déduite couvre aussi d'autres histoires non protégées
+    (cas réel observé : un cluster "Jean Rochefort" regroupait à tort des pistes de Pinocchio,
+    en réalité interprété par Anouk Grinberg selon les tags ID3/casting confirmé)."""
     identity = leaf["identity"]
     now = datetime.now(timezone.utc).isoformat()
+    members = [m for m in leaf["members"] if m["story_id"] not in verified_story_ids]
+    if not members:
+        return 0
+
     cur = await conn.execute(
         "INSERT INTO narrator_identities "
         "(inferred_name, confidence, is_professional, reasoning, cluster_threshold, created_at) "
@@ -221,12 +234,12 @@ async def _persist_leaf(conn: aiosqlite.Connection, leaf: dict, threshold: float
     await conn.executemany(
         "INSERT INTO narrator_identity_members (identity_id, story_id, track_id, speaker_label) "
         "VALUES (?, ?, ?, ?)",
-        [(identity_id, m["story_id"], m["track_id"], m["speaker_label"]) for m in leaf["members"]],
+        [(identity_id, m["story_id"], m["track_id"], m["speaker_label"]) for m in members],
     )
 
     n_pushed = 0
     if identity["confidence"] == "haute" and identity["inferred_name"]:
-        story_ids = sorted({m["story_id"] for m in leaf["members"]})
+        story_ids = sorted({m["story_id"] for m in members})
         await conn.executemany(
             "UPDATE stories SET narrator = ?, updated_at = ? WHERE id = ?",
             [(identity["inferred_name"], now, sid) for sid in story_ids],
@@ -257,6 +270,17 @@ async def run(threshold: float | None = None, persist: bool = True) -> dict:
         embeddings = await _load_embeddings(conn)
         rows_by_story = await _load_story_meta(conn)
 
+        # Histoires à casting de référence vérifié (voir db.story_cast_verified) : le
+        # clustering acoustique ne doit jamais les réassigner, ni dans
+        # narrator_identity_members ni sur stories.narrator - voir _persist_leaf.
+        async with conn.execute("SELECT DISTINCT story_id FROM story_cast_verified") as cur:
+            verified_story_ids = {row[0] for row in await cur.fetchall()}
+        if verified_story_ids:
+            logger.info(
+                f"narrator_identity: {len(verified_story_ids)} histoire(s) à casting vérifié, "
+                f"exclue(s) du clustering acoustique"
+            )
+
         if persist:
             await conn.execute("DELETE FROM narrator_identity_members")
             await conn.execute("DELETE FROM narrator_identities")
@@ -281,7 +305,7 @@ async def run(threshold: float | None = None, persist: bool = True) -> dict:
             leaves.extend(cluster_leaves)
             if persist:
                 for leaf in cluster_leaves:
-                    n_pushed += await _persist_leaf(conn, leaf, threshold)
+                    n_pushed += await _persist_leaf(conn, leaf, threshold, verified_story_ids)
             logger.info(f"narrator_identity: cluster {i}/{len(multi_clusters)} traité ({len(cluster_leaves)} identités)")
 
     result = {
